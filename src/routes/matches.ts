@@ -60,6 +60,14 @@ matchRouter.post("/", async (req, res) => {
       })
       .returning();
 
+    const broadCastMatchCreated = res.app.locals.broadCastMatchCreated;
+    if (broadCastMatchCreated) {
+      try {
+        broadCastMatchCreated(event);
+      } catch (broadcastError) {
+        console.error("Failed to broadcast match_created", broadcastError);
+      }
+    }
     res.status(200).json({ data: event });
   } catch (e) {
     res
