@@ -7,6 +7,50 @@ type JSONPayload = Record<string, unknown>;
 
 interface AliveSocket extends WebSocket {
   isAlive: boolean;
+  subscriptions: Set<number>;
+}
+
+const matchSubscribers = new Map<number, Set<WebSocket>>();
+
+function subscribe(matchId: number, socket: WebSocket) {
+  let subscribers = matchSubscribers.get(matchId);
+  if (!subscribers) {
+    subscribers = new Set<WebSocket>();
+    matchSubscribers.set(matchId, subscribers);
+  }
+
+  subscribers.add(socket);
+}
+
+function unsubscribe(matchId: number, socket: WebSocket) {
+  const subscribers = matchSubscribers.get(matchId);
+
+  if (!subscribers) return;
+  subscribers.delete(socket);
+
+  if (subscribers.size === 0) {
+    matchSubscribers.delete(matchId);
+  }
+}
+
+function cleanupSubscriptions(socket: AliveSocket) {
+  for (const matchId of socket.subscriptions) {
+    unsubscribe(matchId, socket);
+  }
+}
+
+function broadCastToMatch(matchId: number, payload: JSONPayload) {
+  const subscribers = matchSubscribers.get(matchId);
+
+  if (!subscribers || subscribers.size === 0) return;
+
+  const message = JSON.stringify(payload);
+
+  for (const client of subscribers) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    }
+  }
 }
 
 function sendJSON(socket: WebSocket, payload: JSONPayload): void {
@@ -14,10 +58,45 @@ function sendJSON(socket: WebSocket, payload: JSONPayload): void {
   socket.send(JSON.stringify(payload));
 }
 
-function broadCast(wss: WebSocketServer, payload: JSONPayload): void {
+function broadCastToAll(wss: WebSocketServer, payload: JSONPayload): void {
   for (const client of wss.clients) {
     if (client.readyState !== WebSocket.OPEN) continue;
     client.send(JSON.stringify(payload));
+  }
+}
+
+function handleMessage(socket: AliveSocket, data: { toString: () => string }) {
+  let message: { type?: string; matchId?: number };
+
+  try {
+    message = JSON.parse(data.toString());
+  } catch {
+    sendJSON(socket, { type: "error", message: "Invalid JSON" });
+    return;
+  }
+
+  if (
+    message?.type === "subscribe" &&
+    typeof message.matchId === "number" &&
+    Number.isInteger(message.matchId)
+  ) {
+    // matchId is narrowed to number by the typeof check
+    subscribe(message.matchId, socket);
+    socket.subscriptions.add(message.matchId);
+    sendJSON(socket, { type: "subscribed", matchId: message.matchId });
+
+    return;
+  }
+
+  if (
+    message?.type === "unsubscribe" &&
+    typeof message.matchId === "number" &&
+    Number.isInteger(message.matchId)
+  ) {
+    // matchId is narrowed to number by the typeof check
+    unsubscribe(message.matchId, socket);
+    socket.subscriptions.delete(message.matchId);
+    sendJSON(socket, { type: "unsubscribed", matchId: message.matchId });
   }
 }
 
@@ -41,11 +120,9 @@ export function attachWebSocketServer(server: Server) {
     maxPayload: 1024 * 1024,
   });
 
-  // ── Arcjet gate: runs before the WebSocket handshake ──────────────────────
   server.on(
     "upgrade",
     async (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-      // Only intercept requests to the /ws path
       if (req.url !== "/ws") {
         socket.destroy();
         return;
@@ -70,25 +147,35 @@ export function attachWebSocketServer(server: Server) {
         }
       }
 
-      // Arcjet passed — complete the handshake
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit("connection", ws, req);
       });
     },
   );
 
-  // ── Connection handler: no protection logic here ──────────────────────────
   wss.on("connection", (socket: AliveSocket) => {
     socket.isAlive = true;
+    socket.subscriptions = new Set();
+
     socket.on("pong", () => {
       socket.isAlive = true;
+    });
+
+    socket.on("message", (data) => {
+      handleMessage(socket, data);
+    });
+
+    socket.on("error", () => {
+      socket.terminate();
+    });
+    socket.on("close", () => {
+      cleanupSubscriptions(socket);
     });
 
     sendJSON(socket, { type: "welcome" });
     socket.on("error", console.error);
   });
 
-  // ── Heartbeat: ping/pong every 30s ────────────────────────────────────────
   const interval = setInterval(() => {
     wss.clients.forEach((client) => {
       const socket = client as AliveSocket;
@@ -101,8 +188,12 @@ export function attachWebSocketServer(server: Server) {
   wss.on("close", () => clearInterval(interval));
 
   function broadCastMatchCreated(match: JSONPayload): void {
-    broadCast(wss, { type: "match_created", data: match });
+    broadCastToAll(wss, { type: "match_created", data: match });
   }
 
-  return { broadCastMatchCreated };
+  function broadCastCommentary(matchId: number, comment: JSONPayload) {
+    broadCastToMatch(matchId, { type: "commentary", data: comment });
+  }
+
+  return { broadCastMatchCreated, broadCastCommentary };
 }
